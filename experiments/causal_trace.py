@@ -3,6 +3,7 @@ import json
 import os
 import re
 from collections import defaultdict
+from time import time  # HA
 
 import numpy
 import torch
@@ -10,6 +11,7 @@ from datasets import load_dataset
 from matplotlib import pyplot as plt
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import LlamaForCausalLM, LlamaTokenizer  # HA
 
 from dsets import KnownsDataset
 from rome.tok_dataset import (
@@ -47,6 +49,11 @@ def main():
             "gpt2-large",
             "gpt2-medium",
             "gpt2",
+            # HA
+            "meta-llama/Llama-2-7b-hf",
+            "meta-llama/Llama-2-7b-hf-chat",
+            "LeoLM/leo-hessianai-7b",
+            "LeoLM/leo-hessianai-7b-chat",
         ],
     )
     aa("--fact_file", default=None)
@@ -63,7 +70,7 @@ def main():
     os.makedirs(result_dir, exist_ok=True)
     os.makedirs(pdf_dir, exist_ok=True)
 
-    # Half precision to let the 20b model fit.
+    # Half precision to let the 20b model fit.  => HA: hmmm
     torch_dtype = torch.float16 if "20b" in args.model_name else None
 
     mt = ModelAndTokenizer(args.model_name, torch_dtype=torch_dtype)
@@ -74,7 +81,7 @@ def main():
         with open(args.fact_file) as f:
             knowns = json.load(f)
 
-    noise_level = args.noise_level
+    noise_level = args.noise_level  # HA: hmmm
     uniform_noise = False
     if isinstance(noise_level, str):
         if noise_level.startswith("s"):
@@ -297,7 +304,7 @@ def trace_with_repatch(
 def calculate_hidden_flow(
     mt,
     prompt,
-    subject,
+    subject,  # HA: words to highlight/trace
     samples=10,
     noise=0.1,
     token_range=None,
@@ -305,26 +312,33 @@ def calculate_hidden_flow(
     replace=False,
     window=10,
     kind=None,
-    expect=None,
+    expect=None,  # HA: check expected prediction
 ):
     """
     Runs causal tracing over every token/layer combination in the network
     and returns a dictionary numerically summarizing the results.
     """
-    inp = make_inputs(mt.tokenizer, [prompt] * (samples + 1))
+    inp = make_inputs(mt.tokenizer, [prompt] * (samples + 1))  # HA: tokenizer
     with torch.no_grad():
         answer_t, base_score = [d[0] for d in predict_from_input(mt.model, inp)]
     [answer] = decode_tokens(mt.tokenizer, [answer_t])
+
     if expect is not None and answer.strip() != expect:
         return dict(correct_prediction=False)
+
     e_range = find_token_range(mt.tokenizer, inp["input_ids"][0], subject)
     if token_range == "subject_last":
         token_range = [e_range[1] - 1]
     elif token_range is not None:
         raise ValueError(f"Unknown token_range: {token_range}")
+
     low_score = trace_with_patch(
         mt.model, inp, [], answer_t, e_range, noise=noise, uniform_noise=uniform_noise
     ).item()
+    # HA. unclear what this is for. but the actual is different between Llama2 and GPTJ
+    # print("DBG low_score:", low_score)
+
+    # HA: kind can be None, mpt, attn
     if not kind:
         differences = trace_important_states(
             mt.model,
@@ -459,20 +473,24 @@ class ModelAndTokenizer:
     ):
         if tokenizer is None:
             assert model_name is not None
-            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            tokenizer = AutoTokenizer.from_pretrained(model_name)  # HA: takes ~ 0.5sec
         if model is None:
             assert model_name is not None
+            st = time()
             model = AutoModelForCausalLM.from_pretrained(
                 model_name, low_cpu_mem_usage=low_cpu_mem_usage, torch_dtype=torch_dtype
             )
+            print("DBG: AutoModelForCausalLM(", model_name, ") in",
+                  numpy.round(time() - st, 1), "sec")  # HA: takes ~140s, not sure why!!
             nethook.set_requires_grad(False, model)
             model.eval().cuda()
         self.tokenizer = tokenizer
         self.model = model
+        # HA: (i) added |model for Llama (ii) code below takes ~ 0.5 sec
         self.layer_names = [
             n
             for n, m in model.named_modules()
-            if (re.match(r"^(transformer|gpt_neox)\.(h|layers)\.\d+$", n))
+            if (re.match(r"^(transformer|gpt_neox|model)\.(h|layers)\.\d+$", n))
         ]
         self.num_layers = len(self.layer_names)
 
@@ -485,10 +503,21 @@ class ModelAndTokenizer:
 
 
 def layername(model, num, kind=None):
-    if hasattr(model, "transformer"):
+    if kind is not None and kind != "embed" and kind != "mlp" and kind != "attn":
+        print("DBG layername():", num, kind)   # HA
+
+    # HA keeping their own `hasattr` instead of checking `str(type(model))` re speed
+    if hasattr(model, "transformer"):  # for GPTJ
         if kind == "embed":
             return "transformer.wte"
         return f'transformer.h.{num}{"" if kind is None else "." + kind}'
+    # HA addeding below, new, for LLama
+    if hasattr(model, "model"):  # HA, for Llama
+        if kind == "embed":
+            return "model.embed_tokens"
+        if kind == "attn":
+            kind = "self_attn"
+        return f'model.layers.{num}{"" if kind is None else "." + kind}'
     if hasattr(model, "gpt_neox"):
         if kind == "embed":
             return "gpt_neox.embed_in"
@@ -583,7 +612,7 @@ def plot_trace_heatmap(result, savepdf=None, title=None, xlabel=None, modelname=
             plt.show()
 
 
-def plot_all_flow(mt, prompt, subject=None):
+def plot_all_flow(mt, prompt, subject=None):  # HA notebook's version also has noise passed
     for kind in ["mlp", "attn", None]:
         plot_hidden_flow(mt, prompt, subject, kind=kind)
 
@@ -609,12 +638,18 @@ def make_inputs(tokenizer, prompts, device="cuda"):
 def decode_tokens(tokenizer, token_array):
     if hasattr(token_array, "shape") and len(token_array.shape) > 1:
         return [decode_tokens(tokenizer, row) for row in token_array]
+    # HA: basic case from find_token_range() ends up here
     return [tokenizer.decode([t]) for t in token_array]
 
 
 def find_token_range(tokenizer, token_array, substring):
     toks = decode_tokens(tokenizer, token_array)
     whole_string = "".join(toks)
+    # HA. for llama, we need following, cause no space in tokens
+    #     (note, " ".join() also doesn't work as that puts unnecessary spaces)
+    #     (also there is an extra <s> token at start which I think we can ignore)
+    if "LlamaTokenizer" in str(type(tokenizer)):
+        substring = substring.replace(" ", "")
     char_loc = whole_string.index(substring)
     loc = 0
     tok_start, tok_end = None, None
@@ -625,6 +660,7 @@ def find_token_range(tokenizer, token_array, substring):
         if tok_end is None and loc >= char_loc + len(substring):
             tok_end = i + 1
             break
+    #print("DBG", tok_start, tok_end)
     return (tok_start, tok_end)
 
 

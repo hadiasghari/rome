@@ -1,8 +1,11 @@
 from pathlib import Path
 
 import yaml
+import os
 
-with open("globals.yml", "r") as stream:
+module_dir = os.path.dirname(os.path.abspath(__file__))  # HA
+
+with open(os.path.join(module_dir, "./globals.yml"), "r") as stream:
     data = yaml.safe_load(stream)
 
 (RESULTS_DIR, DATA_DIR, STATS_DIR, HPARAMS_DIR,) = (

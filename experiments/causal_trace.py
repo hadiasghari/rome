@@ -318,6 +318,7 @@ def calculate_hidden_flow(
     Runs causal tracing over every token/layer combination in the network
     and returns a dictionary numerically summarizing the results.
     """
+    print("DBG: calculate_hidden_flow: 1")   
     inp = make_inputs(mt.tokenizer, [prompt] * (samples + 1))  # HA: tokenizer
     with torch.no_grad():
         answer_t, base_score = [d[0] for d in predict_from_input(mt.model, inp)]
@@ -339,6 +340,7 @@ def calculate_hidden_flow(
     # print("DBG low_score:", low_score)
 
     # HA: kind can be None, mpt, attn
+    print("DBG: calculate_hidden_flow: 2 -- slowest")
     if not kind:
         differences = trace_important_states(
             mt.model,
@@ -366,6 +368,7 @@ def calculate_hidden_flow(
             token_range=token_range,
         )
     differences = differences.detach().cpu()
+    print("DBG: calculate_hidden_flow: 3")
     return dict(
         scores=differences,
         low_score=low_score,
@@ -396,6 +399,7 @@ def trace_important_states(
 
     if token_range is None:
         token_range = range(ntoks)
+    print("DBG: trace_important_states token_range:", token_range, "num_layers:", num_layers)
     for tnum in token_range:
         row = []
         for layer in range(num_layers):
@@ -470,6 +474,8 @@ class ModelAndTokenizer:
         tokenizer=None,
         low_cpu_mem_usage=False,
         torch_dtype=None,
+        load_in_4bit=False,  # HA added new
+        load_in_8bit=False,
     ):
         if tokenizer is None:
             assert model_name is not None
@@ -477,13 +483,21 @@ class ModelAndTokenizer:
         if model is None:
             assert model_name is not None
             st = time()
+            device_map = None  # HA
+            if load_in_4bit or load_in_8bit:
+                device_map = "auto"
+                low_cpu_mem_usage = True
             model = AutoModelForCausalLM.from_pretrained(
-                model_name, low_cpu_mem_usage=low_cpu_mem_usage, torch_dtype=torch_dtype
+                model_name, low_cpu_mem_usage=low_cpu_mem_usage, torch_dtype=torch_dtype, 
+                load_in_4bit=load_in_4bit, load_in_8bit=load_in_8bit, device_map=device_map  # HA
             )
             print("DBG: AutoModelForCausalLM(", model_name, ") in",
                   numpy.round(time() - st, 1), "sec")  # HA: takes ~140s, not sure why!!
             nethook.set_requires_grad(False, model)
-            model.eval().cuda()
+            if load_in_8bit or load_in_4bit:
+                model.eval()
+            else:    
+                model.eval().cuda()
         self.tokenizer = tokenizer
         self.model = model
         # HA: (i) added |model for Llama (ii) code below takes ~ 0.5 sec
@@ -560,6 +574,7 @@ def plot_hidden_flow(
 
 
 def plot_trace_heatmap(result, savepdf=None, title=None, xlabel=None, modelname=None):
+    print("DBG: plot_trace_heatmap: 1")
     differences = result["scores"]
     low_score = result["low_score"]
     answer = result["answer"]
@@ -573,7 +588,8 @@ def plot_trace_heatmap(result, savepdf=None, title=None, xlabel=None, modelname=
     for i in range(*result["subject_range"]):
         labels[i] = labels[i] + "*"
 
-    with plt.rc_context(rc={"font.family": "Times New Roman"}):
+    print("DBG: plot_trace_heatmap: 2")
+    with plt.rc_context(rc={"font.family": "serif"}):  # HA, instead of Times New Roman, use serif
         fig, ax = plt.subplots(figsize=(3.5, 2), dpi=200)
         h = ax.pcolor(
             differences,
@@ -611,6 +627,7 @@ def plot_trace_heatmap(result, savepdf=None, title=None, xlabel=None, modelname=
         else:
             plt.show()
 
+    print("DBG: plot_trace_heatmap: 3")
 
 def plot_all_flow(mt, prompt, subject=None):  # HA notebook's version also has noise passed
     for kind in ["mlp", "attn", None]:
